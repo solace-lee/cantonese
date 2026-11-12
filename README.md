@@ -15,6 +15,8 @@ npm run dev
 npm run build
 ```
 
+换机交接、当前限制与后续开发计划见 [docs/roadmap.md](./docs/roadmap.md)。
+
 ## 已实现
 
 - 四套可切换的 SVG 学习场景：蓝天草地、欢乐球场、荷花池塘、玩具房间
