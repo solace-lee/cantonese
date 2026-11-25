@@ -40,6 +40,8 @@ export type StructuredChatTurn = {
   lessonHint?: string
   sceneSpec?: unknown
   sceneTheme?: string
+  sceneBrief?: string
+  sceneTags?: string[]
 }
 
 export type ChatResult = {

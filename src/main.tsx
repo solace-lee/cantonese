@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { ChatClient } from './lib/chatClient'
-import type { ChatMessage } from './lib/types'
+import { ChatClient, describeChatClientError, isAbortError } from './lib/chatClient'
+import type { AgeGroup, ChatMessage } from './lib/types'
+import { AGE_PROFILES, getAgeProfile } from './lib/ageProfiles'
 import { DEFAULT_SCENE_SPECS, isValidGeneratedScene, normalizeSceneSpec } from './lib/sceneSpec'
 import type { SceneSpec } from './lib/sceneSpec'
 import { SceneSpecRenderer } from './lib/sceneRenderer'
 import { getCachedScene, setCachedScene, clearSceneCache } from './lib/sceneCache'
+import {
+  DEFAULT_SCENE_BRIEFS,
+  SCENE_ELEMENT_TYPES,
+  sanitizeSceneBrief,
+  sanitizeSceneTags,
+  sceneCacheSignature,
+} from './lib/sceneContext'
 import './styles.css'
 
 type SceneKey = 'sky' | 'playground' | 'pond' | 'playroom'
 type MouthFrame = 'closed' | 'a' | 'i' | 'u'
 
-const scenePrompt = `你是儿童粤语学习网站的场景设计师。请只返回 JSON 对象 {"reply":"场景已准备好","sceneSpec":{"version":1,"theme":"sky|playground|pond|playroom","label":"短场景名","palette":"色彩描述","elements":[{"type":"cloud|sun|tree|ball|flower|pond|duck|toy|hill|star","x":100,"y":100,"scale":1,"color":"#ffffff","animation":"none|float|pulse"}],"character":{"pose":"wave|point|jump|idle","mood":"happy|curious|excited|calm"}}}。画布 760×420；elements 最多 24 个，仅允许所列类型、六位十六进制颜色、x 为 0–760、y 为 0–420、scale 为 0.3–2.5。不要输出 SVG、HTML、链接或代码。`
+const sceneElementTypes = SCENE_ELEMENT_TYPES.join('|')
+const scenePrompt = `你是儿童粤语学习网站的场景设计师。请只返回 JSON 对象 {"reply":"场景已准备好","sceneSpec":{"version":1,"theme":"sky|playground|pond|playroom","label":"短场景名","palette":"sunny|day|field|water|warm|dusk","elements":[{"type":"${sceneElementTypes}","x":100,"y":100,"scale":1,"color":"#ffffff","opacity":1,"zIndex":0,"animation":"none|float|pulse"}],"character":{"pose":"wave|point|jump|idle","mood":"happy|curious|excited|calm"}}}。画布 760×420；elements 最多 24 个且至少 1 个，仅允许所列类型、六位十六进制颜色、x 为 0–760、y 为 0–420、scale 为 0.3–2.5、opacity 为 0.15–1、zIndex 为 -5–5。按场景摘要安排具体位置和关系，使用少量有意义的 float/pulse 动画。摘要若含个人信息，不要复述或放入 label。不要输出 SVG、HTML、链接或代码。`
 
 type ApiConfig = {
   provider: string
@@ -22,42 +31,26 @@ type ApiConfig = {
   systemPrompt: string
 }
 
-type AgeBand = '3-6' | '6-12' | '12+'
-
-const ageProfiles: Record<AgeBand, {
-  label: string
-  shortLabel: string
-  prompt: string
-  lessonTitle: string
-  lessonHint: string
-  coachTitle: string
-  placeholder: string
-  interactionHint: string
-  suggestions: string[]
-}> = {
-  '3-6': {
-    label: '3–6 岁 · 小小探索家', shortLabel: '3–6 岁',
-    prompt: '面向 3–6 岁幼儿：每次只说一句短句，使用简单词汇、拟声词和鼓励语，多用游戏、颜色、动物来引导。',
-    lessonTitle: '和小麦玩一玩粤语', lessonHint: '先听一个词，再跟着小麦做动作、说一遍。', coachTitle: '准备好玩一玩吗？', placeholder: '点击句子，或请家长帮忙输入', interactionHint: '单句 + 图片 + 动作', suggestions: ['早晨！', '这是什么？'],
-  },
-  '6-12': {
-    label: '6–12 岁 · 小小探险家', shortLabel: '6–12 岁',
-    prompt: '面向 6–12 岁儿童：用 1–2 句自然粤语对话，补充粤拼和生活例子，让孩子先猜再说。',
-    lessonTitle: '和小麦一起说粤语', lessonHint: '先听一遍，再跟着小麦说一遍。', coachTitle: '准备好跟读了吗？', placeholder: '问问小麦：点讲“你好”？', interactionHint: '短对话 + 粤拼 + 提示', suggestions: ['帮我练习打招呼', '点讲“谢谢”？', '我想去球场'],
-  },
-  '12+': {
-    label: '12+ · 自由对话', shortLabel: '12+ 岁',
-    prompt: '面向 12 岁以上学习者：可以进行多轮粤语自由对话，适当纠正语气、语法和用词，解释自然表达。',
-    lessonTitle: '把粤语说得更自然', lessonHint: '你可以自由提问，小麦会根据上下文继续聊下去。', coachTitle: '想聊什么都可以', placeholder: '问问小麦：帮我练习点餐', interactionHint: '自由对话 + 纠音 + 解释', suggestions: ['帮我练习点餐', '纠正这句粤语', '讲一个香港小故事'],
-  },
-}
+type AgeBand = AgeGroup
 
 const defaultApiConfig: ApiConfig = {
   provider: 'OpenAI 兼容接口',
-  baseUrl: 'https://api.openai.com/v1',
-  model: 'gpt-4o-mini',
+  baseUrl: '',
+  model: '',
   apiKey: '',
   systemPrompt: '你是一位温柔、活泼的儿童粤语老师。用简短、鼓励的粤语和普通话解释。',
+}
+
+const emptyApiConfig: ApiConfig = {
+  ...defaultApiConfig,
+  baseUrl: '',
+  model: '',
+  apiKey: '',
+}
+
+type ConnectionState = {
+  status: 'idle' | 'testing' | 'success' | 'error'
+  message: string
 }
 
 const scenes: Record<SceneKey, { label: string; sublabel: string; color: string; icon: string }> = {
@@ -223,12 +216,36 @@ function Waveform({ active }: { active: boolean }) {
   return <div className={`waveform ${active ? 'waveform-active' : ''}`} aria-hidden="true">{Array.from({ length: 22 }, (_, index) => <span key={index} style={{ '--bar-height': `${12 + ((index * 17) % 26)}px`, '--bar-delay': `${index * 0.035}s` } as React.CSSProperties} />)}</div>
 }
 
+function readStoredApiConfig(): ApiConfig {
+  try {
+    const stored = JSON.parse(localStorage.getItem('canto-api-config') || '{}') as Partial<ApiConfig>
+    return {
+      ...defaultApiConfig,
+      ...stored,
+      baseUrl: typeof stored.baseUrl === 'string' ? stored.baseUrl : defaultApiConfig.baseUrl,
+      model: typeof stored.model === 'string' ? stored.model : defaultApiConfig.model,
+      apiKey: typeof stored.apiKey === 'string' ? stored.apiKey : '',
+      systemPrompt: typeof stored.systemPrompt === 'string' ? stored.systemPrompt : defaultApiConfig.systemPrompt,
+    }
+  } catch {
+    return { ...defaultApiConfig }
+  }
+}
+
+function readStoredAgeBand(): AgeBand {
+  const saved = localStorage.getItem('canto-age-band')
+  if (saved === '12+') return '12-plus'
+  return saved === '3-6' || saved === '6-12' || saved === '12-plus' ? saved : '6-12'
+}
+
+type SceneGenerationContext = {
+  brief?: unknown
+  tags?: unknown
+}
+
 function App() {
   const [scene, setScene] = useState<SceneKey>('sky')
-  const [ageBand, setAgeBand] = useState<AgeBand>(() => {
-    const saved = localStorage.getItem('canto-age-band')
-    return saved === '3-6' || saved === '6-12' || saved === '12+' ? saved : '6-12'
-  })
+  const [ageBand, setAgeBand] = useState<AgeBand>(readStoredAgeBand)
   const [isTvMode, setIsTvMode] = useState(() => localStorage.getItem('canto-display-mode') === 'tv')
   const [isAgeMenuOpen, setIsAgeMenuOpen] = useState(false)
   const [activePhrase, setActivePhrase] = useState(1)
@@ -239,21 +256,30 @@ function App() {
   const [toastMessage, setToastMessage] = useState('')
   const [chatInput, setChatInput] = useState('')
   const [chatError, setChatError] = useState('')
+  const [lastFailedPrompt, setLastFailedPrompt] = useState('')
   const [isChatting, setIsChatting] = useState(false)
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([])
   const [generatedScene, setGeneratedScene] = useState<SceneSpec | null>(null)
   const [sceneStatus, setSceneStatus] = useState('内置场景')
   const sceneRequest = useRef(0)
   const chatRequest = useRef(0)
+  const sceneAbort = useRef<AbortController | null>(null)
+  const chatAbort = useRef<AbortController | null>(null)
+  const connectionAbort = useRef<AbortController | null>(null)
+  const connectionRequest = useRef(0)
+  const sceneContext = useRef<Required<SceneGenerationContext>>({
+    brief: DEFAULT_SCENE_BRIEFS.sky,
+    tags: sanitizeSceneTags(undefined, 'sky'),
+  })
   const [lessonHint, setLessonHint] = useState('')
   const [replySpeech, setReplySpeech] = useState('')
-  const [apiConfig, setApiConfig] = useState<ApiConfig>(() => {
-    try { return { ...defaultApiConfig, ...(JSON.parse(localStorage.getItem('canto-api-config') || '{}')) } } catch { return defaultApiConfig }
-  })
+  const [apiConfig, setApiConfig] = useState<ApiConfig>(readStoredApiConfig)
   const [draftConfig, setDraftConfig] = useState<ApiConfig>(apiConfig)
+  const [rememberApiKey, setRememberApiKey] = useState(() => Boolean(readStoredApiConfig().apiKey))
+  const [connectionState, setConnectionState] = useState<ConnectionState>({ status: 'idle', message: '' })
 
   const currentPhrase = phrases[activePhrase]
-  const ageProfile = ageProfiles[ageBand]
+  const ageProfile = getAgeProfile(ageBand)
   const chatClient = useMemo(() => new ChatClient(apiConfig), [apiConfig])
   const speakingLabel = isSpeaking ? '小麦正在示范' : '点击听发音'
   const canCallModel = Boolean(apiConfig.baseUrl.trim() && apiConfig.model.trim() && (apiConfig.apiKey.trim() || apiConfig.provider === '自定义服务'))
@@ -271,6 +297,12 @@ function App() {
     const timer = window.setTimeout(() => setShowToast(false), 2600)
     return () => window.clearTimeout(timer)
   }, [showToast])
+
+  useEffect(() => () => {
+    chatAbort.current?.abort()
+    sceneAbort.current?.abort()
+    connectionAbort.current?.abort()
+  }, [])
 
   const speakText = (text: string) => {
     if (isSpeaking) {
@@ -300,36 +332,125 @@ function App() {
   }
   const playPhrase = () => speakText(currentPhrase.cantonese)
 
-  const saveApiConfig = () => {
+  const updateDraftConfig = (patch: Partial<ApiConfig>) => {
+    cancelConnectionTest()
+    setDraftConfig((current) => ({ ...current, ...patch }))
+    setConnectionState({ status: 'idle', message: '' })
+  }
+
+  const cancelConnectionTest = () => {
+    connectionRequest.current += 1
+    connectionAbort.current?.abort()
+    connectionAbort.current = null
+  }
+
+  const cancelChatRequest = () => {
     chatRequest.current += 1
-    sceneRequest.current += 1
+    chatAbort.current?.abort()
+    chatAbort.current = null
     setIsChatting(false)
+  }
+
+  const cancelSceneRequest = () => {
+    sceneRequest.current += 1
+    sceneAbort.current?.abort()
+    sceneAbort.current = null
+  }
+
+  const saveApiConfig = () => {
+    cancelConnectionTest()
+    cancelChatRequest()
+    cancelSceneRequest()
     setChatError('')
+    setLastFailedPrompt('')
     setGeneratedScene(null)
     setSceneStatus('内置场景')
-    localStorage.setItem('canto-api-config', JSON.stringify(draftConfig))
-    setApiConfig(draftConfig)
+    const nextConfig: ApiConfig = {
+      ...draftConfig,
+      baseUrl: draftConfig.baseUrl.trim(),
+      model: draftConfig.model.trim(),
+      apiKey: draftConfig.apiKey.trim(),
+    }
+    localStorage.setItem('canto-api-config', JSON.stringify({
+      ...nextConfig,
+      apiKey: rememberApiKey ? nextConfig.apiKey : '',
+    }))
+    setApiConfig(nextConfig)
+    setConnectionState({ status: 'idle', message: '' })
     setIsSettingsOpen(false)
-    setToastMessage('AI 配置已保存，下一次对话会使用新模型')
+    setToastMessage(rememberApiKey ? '配置已保存，API Key 会保存在当前浏览器' : '配置已保存，API Key 仅在当前页面使用')
     setShowToast(true)
   }
 
-  const openSettings = () => { setDraftConfig(apiConfig); setIsSettingsOpen(true) }
-
-  const chooseAgeBand = (nextAge: AgeBand) => {
-    chatRequest.current += 1
-    sceneRequest.current += 1
+  const clearApiConfig = () => {
+    cancelConnectionTest()
+    localStorage.removeItem('canto-api-config')
+    cancelChatRequest()
+    cancelSceneRequest()
+    setApiConfig(emptyApiConfig)
+    setDraftConfig(emptyApiConfig)
+    setRememberApiKey(false)
+    setConnectionState({ status: 'idle', message: '' })
+    setChatError('')
     setGeneratedScene(null)
     setSceneStatus('内置场景')
-    setIsChatting(false)
+    setToastMessage('本机接口配置和 API Key 已清除')
+    setShowToast(true)
+  }
+
+  const openSettings = () => {
+    cancelConnectionTest()
+    setDraftConfig(apiConfig)
+    setConnectionState({ status: 'idle', message: '' })
+    setIsSettingsOpen(true)
+  }
+
+  const closeSettings = () => {
+    cancelConnectionTest()
+    setConnectionState({ status: 'idle', message: '' })
+    setIsSettingsOpen(false)
+  }
+
+  const testConnection = async () => {
+    if (!draftConfig.baseUrl.trim() || !draftConfig.model.trim()) {
+      setConnectionState({ status: 'error', message: '请先填写 Base URL 和模型名称。' })
+      return
+    }
+    connectionAbort.current?.abort()
+    const controller = new AbortController()
+    connectionAbort.current = controller
+    const requestId = ++connectionRequest.current
+    let timedOut = false
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, 15000)
+    setConnectionState({ status: 'testing', message: '正在连接模型服务…' })
+    try {
+      await new ChatClient(draftConfig).testConnection(controller.signal)
+      if (connectionRequest.current === requestId) setConnectionState({ status: 'success', message: '连接成功，可以开始对话。' })
+    } catch (error) {
+      if (connectionRequest.current === requestId) setConnectionState({ status: 'error', message: describeChatClientError(error, timedOut) })
+    } finally {
+      window.clearTimeout(timeout)
+      if (connectionRequest.current === requestId && connectionAbort.current === controller) connectionAbort.current = null
+    }
+  }
+
+  const chooseAgeBand = (nextAge: AgeBand) => {
+    cancelChatRequest()
+    cancelSceneRequest()
+    setGeneratedScene(null)
+    setSceneStatus('内置场景')
     setAgeBand(nextAge)
     setChatHistory([])
     setChatError('')
+    setLastFailedPrompt('')
     setReplySpeech('')
     setLessonHint('')
     localStorage.setItem('canto-age-band', nextAge)
     setIsAgeMenuOpen(false)
-    setToastMessage(`已切换到${ageProfiles[nextAge].label}`)
+    setToastMessage(`已切换到${AGE_PROFILES[nextAge].label}`)
     setShowToast(true)
   }
 
@@ -341,25 +462,42 @@ function App() {
     setShowToast(true)
   }
 
-  const loadScene = async (nextScene: SceneKey, refresh = false) => {
+  const loadScene = async (nextScene: SceneKey, context: SceneGenerationContext = {}, refresh = false) => {
     const requestId = ++sceneRequest.current
+    sceneAbort.current?.abort()
+    const brief = sanitizeSceneBrief(context.brief, nextScene)
+    const tags = sanitizeSceneTags(context.tags, nextScene)
+    sceneContext.current = { brief, tags }
     setScene(nextScene)
     setGeneratedScene(null)
     setSceneStatus('内置场景')
     if (!canCallModel) return
     let cacheBase = apiConfig.baseUrl.split(/[?#]/, 1)[0]
     try { const url = new URL(apiConfig.baseUrl, window.location.origin); cacheBase = `${url.origin}${url.pathname}` } catch { /* Keep the query-free configured path. */ }
-    const cacheKey = `${cacheBase}|${apiConfig.model}|${ageBand}|${nextScene}`
+    const cacheKey = `${cacheBase}|${apiConfig.model}|${ageBand}|v2|${sceneCacheSignature(nextScene, brief, tags)}`
     if (!refresh) {
-      const cached = await getCachedScene(cacheKey)
+      const cached = await getCachedScene(cacheKey, nextScene)
       if (sceneRequest.current !== requestId) return
       if (cached) { setGeneratedScene(cached); setSceneStatus('已加载场景'); return }
     }
     setSceneStatus('正在设计场景…')
     const controller = new AbortController()
-    const timeout = window.setTimeout(() => controller.abort(), 20000)
+    sceneAbort.current = controller
+    let timedOut = false
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, 20000)
     try {
-      const result = await chatClient.send({ ageGroup: ageBand === '12+' ? '12-plus' : ageBand, systemPrompt: scenePrompt, signal: controller.signal, messages: [{ role: 'user', content: `请设计适合儿童的「${scenes[nextScene].label}」场景，theme 必须为 ${nextScene}。` }] })
+      const result = await chatClient.send({
+        ageGroup: ageBand,
+        systemPrompt: scenePrompt,
+        signal: controller.signal,
+        messages: [{
+          role: 'user',
+          content: `请根据以下受约束信息设计儿童场景：${JSON.stringify({ theme: nextScene, label: scenes[nextScene].label, brief, tags })}`,
+        }],
+      })
       const raw = result.turn?.sceneSpec
       if (!isValidGeneratedScene(raw, nextScene)) throw new Error('invalid scene')
       const spec = normalizeSceneSpec(raw, DEFAULT_SCENE_SPECS[nextScene])
@@ -367,58 +505,101 @@ function App() {
       setGeneratedScene(spec)
       setSceneStatus('AI 场景')
       void setCachedScene(cacheKey, spec)
-    } catch {
-      if (sceneRequest.current === requestId) setSceneStatus('使用内置场景')
-    } finally { window.clearTimeout(timeout) }
+    } catch (error) {
+      if (sceneRequest.current === requestId) {
+        setSceneStatus(timedOut
+          ? '场景生成超时，使用内置场景'
+          : isAbortError(error) || (error instanceof Error && error.message.includes('取消'))
+            ? '内置场景'
+            : '场景生成失败，使用内置场景')
+      }
+    } finally {
+      window.clearTimeout(timeout)
+      if (sceneAbort.current === controller) sceneAbort.current = null
+    }
   }
 
-  const generateScene = () => { if (!canCallModel) { openSettings(); return } void loadScene(scene, true) }
+  const generateScene = () => {
+    if (!canCallModel) { openSettings(); return }
+    void loadScene(scene, sceneContext.current, true)
+  }
 
   const clearLocalData = () => {
-    chatRequest.current += 1
-    sceneRequest.current += 1
-    setIsChatting(false)
+    cancelChatRequest()
+    cancelSceneRequest()
     setChatHistory([])
     setChatInput('')
     setChatError('')
+    setLastFailedPrompt('')
     setReplySpeech('')
     setLessonHint('')
     setGeneratedScene(null)
     setSceneStatus('内置场景')
+    sceneContext.current = {
+      brief: DEFAULT_SCENE_BRIEFS[scene],
+      tags: sanitizeSceneTags(undefined, scene),
+    }
     void clearSceneCache()
     setToastMessage('本地对话与场景缓存已清空')
     setShowToast(true)
   }
 
-  const askAi = async () => {
-    const prompt = chatInput.trim()
+  const stopChat = () => {
+    chatAbort.current?.abort()
+  }
+
+  const askAi = async (override?: string) => {
+    const prompt = (override ?? chatInput).trim()
     if (!prompt || isChatting) return
     if (!canCallModel) { setChatError('请先配置模型接口，再开始对话。'); return }
-    const destination: SceneKey | null = /球场|操场|足球场/.test(prompt) ? 'playground' : /池塘|荷塘|水塘/.test(prompt) ? 'pond' : /玩具房|玩具屋|游戏室/.test(prompt) ? 'playroom' : /草地|蓝天|公园/.test(prompt) ? 'sky' : null
-    if (destination && destination !== scene) void loadScene(destination)
+    const baseHistory = chatHistory
     const userMessage: ChatMessage = { role: 'user', content: prompt }
-    const nextHistory = [...chatHistory, userMessage]
+    const nextHistory = [...baseHistory, userMessage]
     const requestId = ++chatRequest.current
-    const chatAgeGroup = ageBand === '12+' ? '12-plus' : ageBand
+    const controller = new AbortController()
+    chatAbort.current?.abort()
+    chatAbort.current = controller
+    let timedOut = false
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, 30000)
     setIsChatting(true)
     setChatError('')
+    setLastFailedPrompt('')
     setReplySpeech('')
     setChatInput('')
     setChatHistory(nextHistory)
     try {
-      const result = await chatClient.send({ messages: nextHistory.slice(-20), ageGroup: chatAgeGroup, systemPrompt: `${ageProfile.prompt}\n请优先返回 JSON：{"reply":"面向孩子的粤语回复","ttsText":"朗读文字","lessonHint":"简短提示","sceneTheme":"sky|playground|pond|playroom|null"}。仅当对话明确转到新的地点时填写 sceneTheme，否则为 null。` })
+      const result = await chatClient.send({
+        messages: nextHistory.slice(-20),
+        ageGroup: ageBand,
+        signal: controller.signal,
+        systemPrompt: `请优先返回 JSON：{"reply":"面向孩子的粤语回复","ttsText":"朗读文字","lessonHint":"简短提示","sceneTheme":"sky|playground|pond|playroom|null","sceneBrief":"仅供画面的简短场景摘要","sceneTags":["pond","duck"]}。sceneBrief 最多 60 个汉字，只写可见场景，不含真实姓名、住址、学校、联系方式或其他个人信息。sceneTags 只能从 ${sceneElementTypes} 中选择，最多 8 个。仅当对话明确转到新的地点或场景变化时填写 sceneTheme、sceneBrief 和 sceneTags，否则均返回 null 或空数组。`,
+      })
       if (chatRequest.current !== requestId) return
       const reply = result.message.content.trim()
       if (!reply) throw new Error('empty model response')
       setReplySpeech(result.turn?.ttsText || reply)
       setLessonHint(result.turn?.lessonHint || '')
       setChatHistory([...nextHistory, { role: 'assistant', content: reply }])
+      setLastFailedPrompt('')
       const suggestedTheme = result.turn?.sceneTheme
-      if (suggestedTheme && Object.hasOwn(scenes, suggestedTheme) && suggestedTheme !== (destination || scene)) void loadScene(suggestedTheme as SceneKey)
-    } catch {
+      if (suggestedTheme && Object.hasOwn(scenes, suggestedTheme)) {
+        void loadScene(suggestedTheme as SceneKey, {
+          brief: result.turn?.sceneBrief,
+          tags: result.turn?.sceneTags,
+        })
+      }
+    } catch (error) {
       if (chatRequest.current !== requestId) return
-      setChatError('连接暂时没有成功，请检查模型设置和网络后重试。')
+      setChatHistory(baseHistory)
+      setChatInput(prompt)
+      setLastFailedPrompt(prompt)
+      setChatError(describeChatClientError(error, timedOut))
     } finally {
+      window.clearTimeout(timeout)
+      if (chatAbort.current === controller) chatAbort.current = null
       if (chatRequest.current === requestId) setIsChatting(false)
     }
   }
@@ -426,10 +607,10 @@ function App() {
   return (
     <div className={`app-shell ${isTvMode ? 'tv-mode' : ''}`} data-age-band={ageBand}>
       <main className="main-content">
-        <header className="topbar"><div className="brand-lockup"><div className="brand-mark"><span>芽</span><i /></div><div><strong>Canto芽</strong><small>儿童粤语小课堂</small></div></div><div className="topbar-actions"><div className="mode-controls"><div className="age-control"><button className="age-toggle" onClick={() => setIsAgeMenuOpen((open) => !open)} aria-expanded={isAgeMenuOpen}><span className="age-toggle-dot" />{ageProfile.shortLabel}<Icon name="chevron" size={13} /></button>{isAgeMenuOpen && <div className="age-menu" role="menu">{(Object.keys(ageProfiles) as AgeBand[]).map((key) => <button key={key} className={`age-option ${ageBand === key ? 'age-option-active' : ''}`} onClick={() => chooseAgeBand(key)}><span>{ageProfiles[key].shortLabel}</span><small>{ageProfiles[key].interactionHint}</small>{ageBand === key && <Icon name="check" size={14} />}</button>)}</div>}</div><button className={`tv-toggle ${isTvMode ? 'tv-toggle-active' : ''}`} onClick={toggleTvMode} aria-pressed={isTvMode}><Icon name="monitor" size={14} /><span>{isTvMode ? '退出大屏' : '大屏模式'}</span></button></div></div></header>
+        <header className="topbar"><div className="brand-lockup"><div className="brand-mark"><span>芽</span><i /></div><div><strong>Canto芽</strong><small>儿童粤语小课堂</small></div></div><div className="topbar-actions"><div className="mode-controls"><div className="age-control"><button className="age-toggle" onClick={() => setIsAgeMenuOpen((open) => !open)} aria-expanded={isAgeMenuOpen}><span className="age-toggle-dot" />{ageProfile.shortLabel}<Icon name="chevron" size={13} /></button>{isAgeMenuOpen && <div className="age-menu" role="menu">{(Object.keys(AGE_PROFILES) as AgeBand[]).map((key) => <button key={key} className={`age-option ${ageBand === key ? 'age-option-active' : ''}`} onClick={() => chooseAgeBand(key)}><span>{AGE_PROFILES[key].shortLabel}</span><small>{AGE_PROFILES[key].interactionHint}</small>{ageBand === key && <Icon name="check" size={14} />}</button>)}</div>}</div><button className={`tv-toggle ${isTvMode ? 'tv-toggle-active' : ''}`} onClick={toggleTvMode} aria-pressed={isTvMode}><Icon name="monitor" size={14} /><span>{isTvMode ? '退出大屏' : '大屏模式'}</span></button></div></div></header>
         <div className="content-grid">
           <section className="learning-column">
-            <div className="welcome-row"><div><p className="eyebrow">{ageProfile.label}</p><h1>一齐讲粤语 <span>☀</span></h1><p className="welcome-subtitle">{ageBand === '12+' ? '和小麦自由聊一会儿，练习更自然的粤语表达。' : '和小麦一起听一听、说一说，在场景中练习粤语。'}</p></div></div>
+            <div className="welcome-row"><div><p className="eyebrow">{ageProfile.label}</p><h1>一齐讲粤语 <span>☀</span></h1><p className="welcome-subtitle">{ageProfile.welcomeCopy}</p></div></div>
             <div className="practice-card">
               <div className="practice-head"><div><div className="section-kicker"><span className="kicker-dot" />{ageProfile.interactionHint}</div><h2>{ageProfile.lessonTitle}</h2><p>{ageProfile.lessonHint}</p></div></div>
               <div className="scene-picker">{(Object.keys(scenes) as SceneKey[]).map((key) => <button key={key} className={`scene-option ${scene === key ? 'scene-option-active' : ''}`} style={{ '--scene-color': scenes[key].color } as React.CSSProperties} onClick={() => void loadScene(key)}><span>{scenes[key].icon}</span><div><strong>{scenes[key].label}</strong><small>{scenes[key].sublabel}</small></div>{scene === key && <Icon name="check" size={15} />}</button>)}</div>
@@ -440,14 +621,31 @@ function App() {
           </section>
 
           <aside className="insight-column">
-            <div className="coach-card"><div className="coach-head"><div><div className="section-kicker"><span className="live-dot" />AI 粤语伙伴</div><h3>{ageProfile.coachTitle}</h3></div></div><div className="coach-wave"><Waveform active={isSpeaking} /></div><div className="coach-quote"><span className="quote-mark">“</span><p>{lessonHint || currentPhrase.note}</p><span className="quote-mark quote-mark-end">”</span></div><button className={`record-button ${isSpeaking ? 'record-button-active' : ''}`} onClick={playPhrase}><span><Icon name={isSpeaking ? "pause" : "play"} size={21} /></span><strong>{isSpeaking ? '点击停止' : '播放示范'}</strong><small>{ageBand === '3-6' ? '听完后做一个动作，再跟小麦说' : '听完后跟着小麦说一遍'}</small></button><div className="ask-row"><input value={chatInput} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void askAi() }} placeholder={ageProfile.placeholder} aria-label="问问小麦" /><button onClick={() => void askAi()} disabled={isChatting || !chatInput.trim()} aria-label="发送问题"><Icon name="arrow" size={14} /></button></div><div className="chat-suggestions">{ageProfile.suggestions.map((suggestion) => <button key={suggestion} onClick={() => setChatInput(suggestion)}>{suggestion}</button>)}</div>{(chatHistory.length > 0 || isChatting) && <div className="chat-transcript" aria-live="polite">{chatHistory.slice(-6).map((message, index) => <div className={`chat-line ${message.role === 'user' ? 'chat-line-user' : 'chat-line-assistant'}`} key={`${message.role}-${index}-${message.content}`}><span>{message.role === 'user' ? '你' : '小麦'}</span><p>{message.content}</p></div>)}{isChatting && <div className="chat-line chat-line-assistant"><span>小麦</span><p>正在想一想…</p></div>}</div>}{chatError && <p className="chat-error" role="alert">{chatError}</p>}{replySpeech && <button className="reply-speech" onClick={() => speakText(replySpeech)}><Icon name={isSpeaking ? "pause" : "play"} size={13} /> {isSpeaking ? "停止播放" : "听小麦说"}</button>}<div className="coach-foot"><button className="clear-chat" onClick={clearLocalData}>清空对话和场景缓存</button><span>{chatHistory.length ? `自由对话 ${chatHistory.length} 条` : '粤语 · zh-HK'}</span></div></div>
+            <div className="coach-card"><div className="coach-head"><div><div className="section-kicker"><span className="live-dot" />AI 粤语伙伴</div><h3>{ageProfile.coachTitle}</h3></div></div><div className="coach-wave"><Waveform active={isSpeaking} /></div><div className="coach-quote"><span className="quote-mark">“</span><p>{lessonHint || currentPhrase.note}</p><span className="quote-mark quote-mark-end">”</span></div><button className={`record-button ${isSpeaking ? 'record-button-active' : ''}`} onClick={playPhrase}><span><Icon name={isSpeaking ? "pause" : "play"} size={21} /></span><strong>{isSpeaking ? '点击停止' : '播放示范'}</strong><small>{ageBand === '3-6' ? '听完后做一个动作，再跟小麦说' : '听完后跟着小麦说一遍'}</small></button><div className="ask-row"><input value={chatInput} disabled={isChatting} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !isChatting) void askAi() }} placeholder={ageProfile.placeholder} aria-label="问问小麦" /><button className="ask-send-button" onClick={() => { if (isChatting) stopChat(); else void askAi() }} disabled={!isChatting && !chatInput.trim()} aria-label={isChatting ? '取消请求' : '发送问题'}><Icon name={isChatting ? "pause" : "arrow"} size={14} /></button></div><div className="chat-suggestions">{ageProfile.suggestions.map((suggestion) => <button key={suggestion} disabled={isChatting} onClick={() => setChatInput(suggestion)}>{suggestion}</button>)}</div>{(chatHistory.length > 0 || isChatting) && <div className="chat-transcript" aria-live="polite">{chatHistory.slice(-6).map((message, index) => <div className={`chat-line ${message.role === 'user' ? 'chat-line-user' : 'chat-line-assistant'}`} key={`${message.role}-${index}-${message.content}`}><span>{message.role === 'user' ? '你' : '小麦'}</span><p>{message.content}</p></div>)}{isChatting && <div className="chat-line chat-line-assistant"><span>小麦</span><p>正在想一想…</p></div>}</div>}{chatError && <div className="chat-error-box" role="alert"><p className="chat-error">{chatError}</p>{lastFailedPrompt && <button className="retry-button" onClick={() => void askAi(lastFailedPrompt)}><Icon name="arrow" size={12} />重试</button>}</div>}{replySpeech && <button className="reply-speech" onClick={() => speakText(replySpeech)}><Icon name={isSpeaking ? "pause" : "play"} size={13} /> {isSpeaking ? "停止播放" : "听小麦说"}</button>}<div className="coach-foot"><button className="clear-chat" onClick={clearLocalData}>清空对话和场景缓存</button><span>{chatHistory.length ? `自由对话 ${chatHistory.length} 条` : '粤语 · zh-HK'}</span></div></div>
             <div className="api-card"><div className="api-card-head"><div className="api-icon"><Icon name="spark" size={17} /></div><div><h3>AI 对话引擎</h3><p>{apiConfig.model || '尚未配置模型'}</p></div><span className={`status-dot ${canCallModel ? 'status-dot-ready' : ''}`} /></div><div className="api-meta"><span>{canCallModel ? '已填写配置，发送时连接' : '请先配置模型'}</span><button onClick={openSettings}>配置 <Icon name="arrow" size={13} /></button></div></div>
 
           </aside>
         </div>
       </main>
 
-      {isSettingsOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsSettingsOpen(false) }}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="settings-modal-head"><div><div className="section-kicker"><span className="kicker-dot" />开发者设置</div><h2 id="settings-title">连接你的 AI 老师</h2><p>对话会发送给所选模型服务；浏览器直连需要服务允许跨域访问。</p></div><button className="icon-button" onClick={() => setIsSettingsOpen(false)} aria-label="关闭"><Icon name="close" /></button></div><div className="settings-form"><label>服务商<select value={draftConfig.provider} onChange={(event) => setDraftConfig({ ...draftConfig, provider: event.target.value })}><option>OpenAI 兼容接口</option><option>DeepSeek</option><option>Moonshot</option><option>自定义服务</option></select></label><label>Base URL<input value={draftConfig.baseUrl} onChange={(event) => setDraftConfig({ ...draftConfig, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></label><div className="form-row"><label>模型名称<input value={draftConfig.model} onChange={(event) => setDraftConfig({ ...draftConfig, model: event.target.value })} placeholder="gpt-4o-mini" /></label><label>API Key<input type="password" value={draftConfig.apiKey} onChange={(event) => setDraftConfig({ ...draftConfig, apiKey: event.target.value })} placeholder="sk-..." /></label></div><label>系统提示词<textarea rows={3} value={draftConfig.systemPrompt} onChange={(event) => setDraftConfig({ ...draftConfig, systemPrompt: event.target.value })} /></label><div className="settings-service-note"><Icon name="lock" size={14} /><span>自定义服务可留空 API Key 以连接代理；其他服务请填写密钥。对话会发送给所选服务。</span></div></div><div className="settings-modal-foot"><span><Icon name="lock" size={14} /> API Key 保存在浏览器，并会发送给模型服务</span><div><button className="secondary-button" onClick={() => setIsSettingsOpen(false)}>取消</button><button className="primary-button" onClick={saveApiConfig}>保存配置 <Icon name="check" size={15} /></button></div></div></section></div>}
+      {isSettingsOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSettings() }}>
+        <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <div className="settings-modal-head"><div><div className="section-kicker"><span className="kicker-dot" />开发者设置</div><h2 id="settings-title">连接你的 AI 老师</h2><p>对话会发送给所选模型服务；浏览器直连需要服务允许跨域访问。</p></div><button className="icon-button" onClick={closeSettings} aria-label="关闭"><Icon name="close" /></button></div>
+          <div className="settings-form">
+            <label>服务商<select value={draftConfig.provider} onChange={(event) => updateDraftConfig({ provider: event.target.value })}><option>OpenAI 兼容接口</option><option>DeepSeek</option><option>Moonshot</option><option>自定义服务</option></select></label>
+            <label>Base URL<input value={draftConfig.baseUrl} onChange={(event) => updateDraftConfig({ baseUrl: event.target.value })} placeholder="https://api.example.com/v1" /></label>
+            <div className="form-row"><label>模型名称<input value={draftConfig.model} onChange={(event) => updateDraftConfig({ model: event.target.value })} placeholder="gpt-4o-mini" /></label><label>API Key<input type="password" autoComplete="off" value={draftConfig.apiKey} onChange={(event) => updateDraftConfig({ apiKey: event.target.value })} placeholder="sk-..." /></label></div>
+            <label className="remember-key-control"><input type="checkbox" checked={rememberApiKey} onChange={(event) => setRememberApiKey(event.target.checked)} /><span><strong>在这台设备保存 API Key</strong><small>{rememberApiKey ? '关闭页面后仍会保存，其他本机脚本也可能读取。' : '只在当前页面内使用，关闭页面后需要重新填写。'}</small></span></label>
+            <label>系统提示词<textarea rows={3} value={draftConfig.systemPrompt} onChange={(event) => updateDraftConfig({ systemPrompt: event.target.value })} /></label>
+            <div className="settings-service-note"><Icon name="lock" size={14} /><span>自定义服务可留空 API Key 以连接代理；其他服务请填写密钥。儿童对话和场景摘要会发送给所选服务。</span></div>
+            <div className={`connection-result connection-result-${connectionState.status}`} role="status">
+              <span>{connectionState.status === 'success' ? <Icon name="check" size={13} /> : <Icon name="spark" size={13} />}{connectionState.message || '保存前可先测试当前草稿配置。'}</span>
+              <button className="secondary-button" onClick={() => void testConnection()} disabled={connectionState.status === 'testing'}>{connectionState.status === 'testing' ? '测试中…' : '测试连接'}</button>
+            </div>
+          </div>
+          <div className="settings-modal-foot"><span><Icon name="lock" size={14} /> API Key 只会发送给配置的模型服务</span><div className="settings-actions"><button className="danger-text-button" onClick={clearApiConfig}>清除配置</button><button className="secondary-button" onClick={closeSettings}>取消</button><button className="primary-button" onClick={saveApiConfig}>保存配置 <Icon name="check" size={15} /></button></div></div>
+        </section>
+      </div>}
       {showToast && <div className="toast"><Icon name="check" size={16} /><span>{toastMessage}</span></div>}
     </div>
   )

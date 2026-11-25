@@ -9,16 +9,48 @@ export type StreamCallbacks = {
   onToken?: (token: string) => void
 }
 
+export type ChatClientErrorKind = 'config' | 'auth' | 'network' | 'timeout' | 'aborted' | 'rate-limit' | 'http' | 'invalid-response'
+
 export class ChatClientError extends Error {
   status?: number
   details?: unknown
+  kind: ChatClientErrorKind
 
-  constructor(message: string, status?: number, details?: unknown) {
+  constructor(message: string, kind: ChatClientErrorKind, status?: number, details?: unknown) {
     super(message)
     this.name = 'ChatClientError'
+    this.kind = kind
     this.status = status
     this.details = details
   }
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+    || Boolean(error && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
+}
+
+export function describeChatClientError(error: unknown, timedOut = false): string {
+  if (timedOut) return '模型响应超时，请检查网络后重试。'
+  if (isAbortError(error)) return '请求已取消。'
+  if (!(error instanceof ChatClientError)) return '暂时无法连接模型，请稍后重试。'
+  if (error.kind === 'aborted') return '请求已取消，可以重新发送。'
+  if (error.kind === 'config') return '模型配置不完整，请检查 Base URL、模型名称和访问方式。'
+  if (error.kind === 'auth') return '模型服务拒绝了访问，请检查 API Key 或代理设置。'
+  if (error.kind === 'network') return '网络请求失败，请检查网络，并确认服务允许浏览器跨域访问（CORS）。'
+  if (error.kind === 'timeout') return '模型响应超时，请检查网络后重试。'
+  if (error.kind === 'rate-limit') return '请求过于频繁或额度不足，请稍后再试。'
+  if (error.kind === 'invalid-response') return '模型返回的内容无法解析，请检查接口是否兼容 OpenAI Chat Completions。'
+  if (error.status && error.status >= 500) return '模型服务暂时不可用，请稍后重试。'
+  return '模型服务暂时没有完成请求，请检查配置后重试。'
+}
+
+function httpErrorKind(status: number): ChatClientErrorKind {
+  if (status === 400 || status === 404 || status === 422) return 'config'
+  if (status === 401 || status === 403) return 'auth'
+  if (status === 408) return 'timeout'
+  if (status === 429) return 'rate-limit'
+  return 'http'
 }
 
 function normaliseBaseUrl(baseUrl: string): string {
@@ -58,13 +90,17 @@ function extractTextContent(value: unknown): string {
 function parseStructuredTurn(content: unknown): StructuredChatTurn {
   if (content && typeof content === 'object' && !Array.isArray(content)) {
     const value = content as Record<string, unknown>
-    if (typeof value.reply !== 'string') return { reply: JSON.stringify(value) }
+    if (typeof value.reply !== 'string') return { reply: '' }
     return {
       reply: value.reply,
       ttsText: typeof value.ttsText === 'string' ? value.ttsText : undefined,
       lessonHint: typeof value.lessonHint === 'string' ? value.lessonHint : undefined,
       sceneSpec: value.sceneSpec,
       sceneTheme: typeof value.sceneTheme === 'string' ? value.sceneTheme : undefined,
+      sceneBrief: typeof value.sceneBrief === 'string' ? value.sceneBrief.slice(0, 160) : undefined,
+      sceneTags: Array.isArray(value.sceneTags)
+        ? value.sceneTags.filter((tag): tag is string => typeof tag === 'string').slice(0, 12).map((tag) => tag.slice(0, 24))
+        : undefined,
     }
   }
 
@@ -87,7 +123,7 @@ export class ChatClient {
 
   constructor(config: ModelConfig, options: ChatClientOptions = {}) {
     this.config = { ...config }
-    this.fetchImpl = options.fetchImpl ?? fetch
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
   }
 
   updateConfig(config: Partial<ModelConfig>): void {
@@ -99,28 +135,55 @@ export class ChatClient {
   }
 
   async send(request: ChatRequest, callbacks: StreamCallbacks = {}): Promise<ChatResult> {
-    const response = await this.fetchImpl(`${normaliseBaseUrl(this.config.baseUrl)}/chat/completions`, {
-      method: 'POST',
-      signal: request.signal,
-      headers: this.headers(),
-      body: JSON.stringify({
-        model: this.config.model,
-        temperature: this.config.temperature ?? 0.7,
-        max_tokens: this.config.maxTokens,
-        stream: Boolean(request.stream),
-        ...(request.responseFormat === 'json_object' ? { response_format: { type: 'json_object' } } : {}),
-        messages: toPayloadMessages(this.config, request),
-      }),
-    })
+    if (!this.config.baseUrl.trim() || !this.config.model.trim()) {
+      throw new ChatClientError('模型配置不完整', 'config')
+    }
+    let response: Response
+    try {
+      response = await this.fetchImpl(`${normaliseBaseUrl(this.config.baseUrl)}/chat/completions`, {
+        method: 'POST',
+        signal: request.signal,
+        headers: this.headers(),
+        body: JSON.stringify({
+          model: this.config.model,
+          temperature: this.config.temperature ?? 0.7,
+          max_tokens: this.config.maxTokens,
+          stream: Boolean(request.stream),
+          ...(request.responseFormat === 'json_object' ? { response_format: { type: 'json_object' } } : {}),
+          messages: toPayloadMessages(this.config, request),
+        }),
+      })
+    } catch (error) {
+      if (isAbortError(error)) throw new ChatClientError('模型请求已取消', 'aborted')
+      throw new ChatClientError('无法连接模型服务', 'network')
+    }
 
     if (!response.ok) {
       const details = await this.readError(response)
-      throw new ChatClientError(`模型接口请求失败（${response.status}）`, response.status, details)
+      const kind = httpErrorKind(response.status)
+      throw new ChatClientError(`模型接口请求失败（${response.status}）`, kind, response.status, details)
     }
 
     if (request.stream) return this.readStream(response, callbacks.onToken)
-    const data = await response.json() as Record<string, unknown>
+    let data: Record<string, unknown>
+    try {
+      data = await response.json() as Record<string, unknown>
+    } catch {
+      throw new ChatClientError('模型返回内容无法解析', 'invalid-response', response.status)
+    }
     return this.parseResult(data)
+  }
+
+  async testConnection(signal?: AbortSignal): Promise<void> {
+    const result = await this.send({
+      messages: [{ role: 'user', content: '这是一个连接测试。请只回复“好”。' }],
+      ageGroup: '12-plus',
+      systemPrompt: '这是接口连接测试。只回复“好”，不要解释或扩展。',
+      signal,
+    })
+    if (!result.message.content.trim()) {
+      throw new ChatClientError('模型返回了空内容', 'invalid-response')
+    }
   }
 
   async sendText(text: string, history: ChatMessage[] = [], ageGroup: AgeGroup = '6-12', callbacks: StreamCallbacks = {}): Promise<ChatResult> {
@@ -143,6 +206,9 @@ export class ChatClient {
     const first = choices[0] ?? {}
     const message = (first.message ?? {}) as Record<string, unknown>
     const turn = parseStructuredTurn(message.content)
+    if (!turn.reply.trim()) {
+      throw new ChatClientError('模型返回了空内容', 'invalid-response')
+    }
     return {
       message: { role: 'assistant', content: turn.reply },
       turn,

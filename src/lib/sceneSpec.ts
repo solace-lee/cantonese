@@ -1,7 +1,11 @@
 export type SceneTheme = 'sky' | 'playground' | 'pond' | 'playroom'
 
-export type SceneElementType = 'cloud' | 'sun' | 'tree' | 'ball' | 'flower' | 'pond' | 'duck' | 'toy' | 'hill' | 'star'
+export type SceneElementType =
+  | 'cloud' | 'sun' | 'tree' | 'ball' | 'flower' | 'pond' | 'duck' | 'toy' | 'hill' | 'star'
+  | 'bird' | 'fish' | 'frog' | 'cat' | 'dog' | 'rabbit' | 'blocks' | 'car' | 'kite' | 'teddy'
+  | 'bench' | 'goal' | 'rainbow' | 'bush'
 export type SceneAnimation = 'float' | 'pulse' | 'none'
+export type ScenePalette = 'sunny' | 'day' | 'field' | 'water' | 'warm' | 'dusk'
 export type CharacterPose = 'wave' | 'point' | 'jump' | 'idle'
 export type CharacterMood = 'happy' | 'curious' | 'excited' | 'calm'
 export type CharacterMouth = 'closed' | 'a' | 'i' | 'u'
@@ -21,7 +25,7 @@ export type SceneSpec = {
   version: 1
   theme: SceneTheme
   label: string
-  palette: string
+  palette: ScenePalette
   elements: SceneElement[]
   character: {
     pose: CharacterPose
@@ -31,8 +35,14 @@ export type SceneSpec = {
 }
 
 const allowedThemes = new Set<SceneTheme>(['sky', 'playground', 'pond', 'playroom'])
-const allowedElementTypes = new Set<SceneElementType>(['cloud', 'sun', 'tree', 'ball', 'flower', 'pond', 'duck', 'toy', 'hill', 'star'])
+export const SCENE_ELEMENT_TYPES: readonly SceneElementType[] = [
+  'cloud', 'sun', 'tree', 'ball', 'flower', 'pond', 'duck', 'toy', 'hill', 'star',
+  'bird', 'fish', 'frog', 'cat', 'dog', 'rabbit', 'blocks', 'car', 'kite', 'teddy',
+  'bench', 'goal', 'rainbow', 'bush',
+]
+const allowedElementTypes = new Set<SceneElementType>(SCENE_ELEMENT_TYPES)
 const allowedAnimations = new Set<SceneAnimation>(['float', 'pulse', 'none'])
+const allowedPalettes = new Set<ScenePalette>(['sunny', 'day', 'field', 'water', 'warm', 'dusk'])
 const allowedPoses = new Set<CharacterPose>(['wave', 'point', 'jump', 'idle'])
 const allowedMoods = new Set<CharacterMood>(['happy', 'curious', 'excited', 'calm'])
 const allowedMouths = new Set<CharacterMouth>(['closed', 'a', 'i', 'u'])
@@ -77,6 +87,10 @@ function asTheme(value: unknown, fallback: SceneTheme): SceneTheme {
   return typeof value === 'string' && allowedThemes.has(value as SceneTheme) ? value as SceneTheme : fallback
 }
 
+function asPalette(value: unknown, fallback: ScenePalette): ScenePalette {
+  return typeof value === 'string' && allowedPalettes.has(value as ScenePalette) ? value as ScenePalette : fallback
+}
+
 export function normalizeSceneSpec(input: unknown, fallback: SceneSpec = DEFAULT_SCENE_SPECS.sky): SceneSpec {
   const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
   const theme = asTheme(raw.theme, fallback.theme)
@@ -110,7 +124,7 @@ export function normalizeSceneSpec(input: unknown, fallback: SceneSpec = DEFAULT
     version: 1,
     theme,
     label: safeLabel(raw.label, fallback.label),
-    palette: safeLabel(raw.palette, fallback.palette),
+    palette: asPalette(raw.palette, fallback.palette),
     elements: elements.length ? elements : fallback.elements,
     character: { pose, mood, mouth },
   }
